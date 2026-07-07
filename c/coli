@@ -8,7 +8,6 @@ CLI per far girare GLM-5.2 (744B) in locale, su CPU, in ~15-26 GB di RAM.
   coli info                 stato: modello, RAM, disco, config
   coli bench [task...]      benchmark di qualità (MMLU/HellaSwag/...)
   coli convert              converte GLM-5.2-FP8 -> int4 (streaming)
-  coli models [add <dir>]   registro multi-modello (scelta all'avvio della chat)
   coli build                compila il motore
 
 Config via env o flag (validi anche dopo il sottocomando):
@@ -88,70 +87,13 @@ def hline(w): return f"{C.dgray}{'─'*w}{C.r}"
 # ---------- util ----------
 def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
-# ---------- registro multi-modello ----------
-# Ogni ARCHITETTURA ha il SUO motore (file C e binario separati): i modelli non si
-# toccano tra loro. Il registro e' models.json accanto a coli: {nome: {dir, arch}}.
-#   coli models                     lista
-#   coli models add <dir> [nome]    registra (arch letta da config.json)
-#   coli chat                       1 modello -> parte; piu' modelli -> scegli all'avvio
-ENGINES = {                          # arch (config.json) -> binario del motore
-    "glm_moe_dsa": "glm",            # GLM-5.2 (MLA + DSA + MTP)          — PRONTO
-    "gpt_oss":     "gptoss",         # gpt-oss-120b (GQA+sinks, MoE 128e) — in arrivo
-    "qwen3_5_moe": "qwenmoe",        # Qwen3.6-A3B (MoE 256e)             — in arrivo
-}
-def model_arch(d):
-    try:
-        c=json.load(open(os.path.join(d,"config.json")))
-        return c.get("model_type") or c.get("text_config",{}).get("model_type") or "?"
-    except Exception: return "?"
-def models_load():
-    reg={}
-    p=os.path.join(HERE,"models.json")
-    if os.path.exists(p):
-        try: reg=json.load(open(p))
-        except Exception: reg={}
-    # il modello di default e' sempre registrato se esiste su disco
-    if DEF_MODEL and os.path.isdir(DEF_MODEL) and not any(v.get("dir")==DEF_MODEL for v in reg.values()):
-        reg.setdefault(os.path.basename(DEF_MODEL), {"dir":DEF_MODEL, "arch":model_arch(DEF_MODEL)})
-    return reg
-def models_save(reg):
-    json.dump(reg, open(os.path.join(HERE,"models.json"),"w"), indent=1)
-def engine_for(model_dir):
-    arch=model_arch(model_dir)
-    binname=ENGINES.get(arch)
-    if not binname:
-        sys.exit(f"{C.yel}architettura '{arch}' non (ancora) supportata.{C.r} Motori pronti: "
-                 +", ".join(f"{k}->{v}" for k,v in ENGINES.items()))
-    path=os.path.join(HERE,binname)
-    if not os.path.exists(path):
-        sys.exit(f"{C.yel}motore '{binname}' non compilato per l'architettura {arch}.{C.r}"
-                 +("  Esegui: coli build" if binname=="glm" else "  (motore in sviluppo)"))
-    return path
-def pick_model(a):
-    """se --model/COLI_MODEL e' esplicito usa quello; altrimenti: 1 registrato -> quello,
-    piu' d'uno -> menu di scelta all'avvio della chat (zero passaggi extra)."""
-    if a.model != DEF_MODEL or not sys.stdin.isatty():
-        return a.model
-    reg=models_load()
-    avail=[(n,v) for n,v in reg.items() if os.path.isdir(v.get("dir",""))]
-    if len(avail)<=1:
-        return avail[0][1]["dir"] if avail else a.model
-    print(f"  {C.dim}modelli disponibili:{C.r}")
-    for i,(n,v) in enumerate(avail):
-        eng=ENGINES.get(v.get("arch","?"),"?")
-        ok = "✓" if os.path.exists(os.path.join(HERE,eng)) else "motore in sviluppo"
-        print(f"    {C.teal}{i+1}{C.r}) {n}  {C.dgray}· {v.get('arch','?')} · {ok}{C.r}")
-    try: ch=input(f"  {C.teal}›{C.r} quale? [1] ").strip() or "1"
-    except EOFError: ch="1"
-    try: return avail[max(0,min(len(avail)-1,int(ch)-1))][1]["dir"]
-    except ValueError: return avail[0][1]["dir"]
-
 def need_model(model):
     if not os.path.isdir(model):
         sys.exit(f"{C.yel}modello non trovato:{C.r} {model}\n  imposta COLI_MODEL o usa --model")
     if not os.path.exists(os.path.join(model,"tokenizer.json")):
         sys.exit(f"{C.yel}manca tokenizer.json in {model}{C.r}")
-    engine_for(model)                 # verifica che il motore per QUESTA architettura esista
+    if not os.path.exists(GLM):
+        sys.exit(f"{C.yel}motore non compilato.{C.r} Esegui:  coli build")
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
@@ -238,21 +180,19 @@ def cmd_info(a):
     print()
 
 def cmd_run(a):
-    a.model=pick_model(a)
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('uso: coli run "il tuo prompt"')
     banner("run")
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
-    sys.exit(subprocess.call([engine_for(a.model), str(a.cap)], env=e))
+    sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
 def cmd_chat(a):
-    a.model=pick_model(a)
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
-    p=subprocess.Popen([engine_for(a.model),str(a.cap)], env=e, stdin=subprocess.PIPE,
+    p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
     sp=Spinner("sveglio il gigante (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
@@ -367,28 +307,6 @@ def cmd_bench(a):
     print(f"  {C.dim}decode disk-bound: su hardware lento questo richiede ORE. Alza --limit su macchine veloci.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
-def cmd_models(a):
-    banner("models")
-    reg=models_load()
-    if a.action and a.action[0]=="add":
-        if len(a.action)<2: sys.exit("uso: coli models add <dir> [nome]")
-        d=os.path.abspath(a.action[1])
-        if not os.path.isdir(d): sys.exit(f"directory non trovata: {d}")
-        name=a.action[2] if len(a.action)>2 else os.path.basename(d)
-        reg[name]={"dir":d,"arch":model_arch(d)}
-        models_save(reg)
-        print(f"  {C.grn}✓{C.r} registrato: {name} · {reg[name]['arch']}\n")
-        return
-    if not reg: print(f"  {C.dim}nessun modello registrato (coli models add <dir>){C.r}\n"); return
-    for n,v in reg.items():
-        eng=ENGINES.get(v.get("arch","?"))
-        st = "pronto ✓" if eng and os.path.exists(os.path.join(HERE,eng)) else \
-             ("motore in sviluppo" if eng else "architettura non supportata")
-        ex = "" if os.path.isdir(v.get("dir","")) else " · DIR MANCANTE"
-        print(f"   {C.teal}{n:<18}{C.r} {C.gray}{v.get('arch','?'):<14}{C.r} {st}{C.yel}{ex}{C.r}")
-        print(f"   {C.dgray}{'':<18} {v.get('dir','')}{C.r}")
-    print()
-
 def cmd_convert(a):
     banner("convert")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
@@ -417,7 +335,6 @@ def main():
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     sub.add_parser("chat", parents=[common])
-    pm=sub.add_parser("models", parents=[common]); pm.add_argument("action", nargs="*")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
@@ -425,7 +342,7 @@ def main():
     pc.add_argument("--no-mtp",action="store_true",help="salta la testa MTP (niente draft speculativi)")
     a=ap.parse_args()
     {"build":cmd_build,"info":cmd_info,"run":cmd_run,"chat":cmd_chat,"bench":cmd_bench,
-     "convert":cmd_convert,"models":cmd_models}.get(a.cmd, lambda _:(banner(),print(__doc__)))(a)
+     "convert":cmd_convert}.get(a.cmd, lambda _:(banner(),print(__doc__)))(a)
 
 if __name__=="__main__":
     signal.signal(signal.SIGINT, signal.default_int_handler)

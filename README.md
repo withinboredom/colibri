@@ -127,18 +127,6 @@ cd c
 
 It prints per-task accuracy (log-likelihood scoring, EleutherAI-harness style). Published full-precision GLM-5.2 scores on these tasks sit around 85–95%; if our int4 container lands within a few points, the quantization is validated — if it doesn't, we know to invest in mixed / grouped-scale quantization. **If you have the hardware to run this, please open an issue with the numbers** — it's the measurement the project is missing.
 
-## More models — the roadmap
-
-colibrì's niche is precise: **MoE models too big for your RAM**. Dense models that fit in RAM (Qwen3.6-27B, etc.) are better served by llama.cpp/ollama — colibrì's streaming adds nothing there, and we won't pretend otherwise. But every big MoE is prey:
-
-| model | status | why it fits |
-|---|---|---|
-| **GLM-5.2** (744B, 40B active) | ✅ ready | the flagship: 370 GB streamed through 25 GB of RAM |
-| **gpt-oss-120b** (117B, 5.1B active) | 🔨 next engine | ~63 GB int4, experts of 12 MB, **~1.8 GB/token — 6× lighter than GLM**: on the same dev box this should be the first *daily-drivable* colibrì model (~2 s/token cold, sub-second warm) |
-| **Qwen3.6-35B-A3B** (35B MoE, 3B active) | 🔭 candidate | 256 tiny experts (1.6 MB): would serve 16 GB machines |
-
-Each architecture gets **its own engine file and binary** (like `glm.c` → `glm`), built with the same method: tiny-random oracle from `transformers`, token-exact validation, then real weights. Engines share the foundations (safetensors streaming, quant kernels, expert LRU + learning cache, tokenizer, serve protocol) but never touch each other. `coli models` manages the registry; with more than one model installed, `coli chat` asks which one to wake up.
-
 ## Supporting the project
 
 colibrì is a one-person project, written and tested entirely on a 12-core laptop with 25 GB of RAM — the numbers above are the ceiling of what I can measure at home. If this project is useful or interesting to you and you'd like to support its development (better test hardware translates *directly* into a faster engine for everyone: real NVMe scaling data, bigger pinned caches, int2/int3 quality sweeps on real benchmarks), you can:
