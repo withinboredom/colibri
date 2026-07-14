@@ -173,7 +173,7 @@ typedef struct {
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    ESlot **ecache; int *ecn; int ecap;          /* LFRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -2757,6 +2757,20 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     attention_rows(m,l,layer,x,S,pos_base,NULL,NULL,out);
 }
 
+/* Victim per la cache streaming di layer / streaming-cache victim: LFRU
+ * (tier_cache_score) al posto della pura LRU, cosi' i load one-shot (expert
+ * dei draft MTP, predizioni PILOT) ruotano tra loro invece di sfrattare gli
+ * expert consolidati (heat>=2). eid<0 = slot pilota nascosto/fallito: peso
+ * morto, esce per primo. */
+static int ecache_victim(const ESlot *Sl, int nn, const uint32_t *heat){
+    int v=0; uint64_t vs=UINT64_MAX;
+    for(int z=0;z<nn;z++){
+        uint64_t s = Sl[z].eid<0 ? 0 : tier_cache_score(heat[Sl[z].eid],Sl[z].used);
+        if(s<vs){ vs=s; v=z; }
+    }
+    return v;
+}
+
 /* MoE GLM su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, + shared expert).
  * BATCH-UNION: per S>1 (prefill, verifica MTP) ogni expert UNICO del batch viene caricato
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
@@ -3272,11 +3286,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
+        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LFRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
+              else dst=&Sl[ecache_victim(Sl,*nn,m->eheat[layer])];
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
@@ -3418,9 +3432,9 @@ static void pilot_realload(Model *m, int layer, int eid){
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
     ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
     for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
+    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LFRU */
     if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
+    else { slot=ecache_victim(Sl,nn,m->eheat[layer]); isnew=0; }
     ESlot *dst=&Sl[slot];
     dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
     g_pilot_inflight[layer]++;

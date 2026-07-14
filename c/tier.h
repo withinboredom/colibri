@@ -53,6 +53,19 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
     *slot=cold; *eid=hot; *gain=(long)((hs-cs)>>8); return 1;
 }
 
+/* Streaming-cache victim rank (lowest = evict first). Saturated frequency is
+ * the primary signal: an expert routed once (MTP draft, wrong PILOT guess)
+ * cannot displace an established one. The slot residency clock breaks ties as
+ * plain LRU, which also protects a just-loaded slot (max clock) from the next
+ * load. Live heat is floored at 1 so an unrouted-but-resident expert (a fresh
+ * PILOT prediction) ranks with the one-shots instead of below them; the cap
+ * at 15 keeps a whole session's undecayed heat comparable — long-hot experts
+ * tie there and recency decides, so stale heat cannot squat forever. */
+static uint64_t tier_cache_score(uint32_t heat, uint64_t used){
+    uint64_t sat=heat<1?1:(heat>15?15:heat);
+    return (sat<<60)|(used&((1ULL<<60)-1));
+}
+
 static void tier_decay(uint32_t *heat, int nexpert){
     for(int e=0;e<nexpert;e++) heat[e]>>=1;
 }
