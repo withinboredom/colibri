@@ -23,14 +23,41 @@ int main(void){
     if(!tier_pick_lfru(freq,last,100,5,live,2,&slot,&eid,&gain)) return fail("LFRU promotion");
     if(slot!=0||eid!=4) return fail("LFRU did not prefer recent ties");
 
-    if(tier_cache_score(1,999)>=tier_cache_score(5,10))
-        return fail("cache score: one-shot did not rank below established");
-    if(tier_cache_score(1000,5)>=tier_cache_score(20,6))
-        return fail("cache score: saturated heat tie not broken by LRU");
-    if(tier_cache_score(15,7)!=tier_cache_score(99,7))
-        return fail("cache score: heat not capped at 15");
-    if(tier_cache_score(0,3)!=tier_cache_score(1,3))
-        return fail("cache score: unrouted resident not floored to one-shot class");
+    /* adaptive-k SLRU lifecycle: saturating freq, ghost memory, turnover */
+    TierAdapt ad; tier_adapt_init(&ad);
+    if(ad.k!=TIER_K0) return fail("initial k");
+    int8_t f[8]={0}; uint32_t rl[8]={0};
+    tier_admit(&f[0]);
+    if(f[0]!=1) return fail("fresh admit not at 1");
+    for(int i=0;i<40;i++) tier_touch(&ad,&f[0],1);
+    if(f[0]!=TIER_FMAX) return fail("freq did not saturate");
+    if(ad.graduated!=1) return fail("crossing k under pressure not counted once");
+    rl[0]=7; tier_evict(&ad,f,8,rl,0,4);
+    if(f[0]!=-TIER_FMAX) return fail("evict did not ghost the freq");
+    if(ad.ev_prot!=1) return fail("protected eviction not counted");
+    tier_admit(&f[0]);
+    if(f[0]!=TIER_FMAX) return fail("ghost did not resume at remembered+1 (capped)");
+    f[1]=-3; rl[1]=10; f[2]=-5; rl[2]=4; f[3]=-2; rl[3]=9;   /* three ghosts */
+    f[4]=6;  rl[4]=8;
+    tier_evict(&ad,f,8,rl,4,3);                              /* fourth ghost, cap 3 */
+    if(f[2]!=0) return fail("turnover did not forget the least-recently-routed ghost");
+    if(f[4]!=-6) return fail("evicted expert lost its ghost to turnover wrongly");
+
+    /* k adaptation: high graduation rate raises k, zero rate lowers it */
+    TierAdapt hi; tier_adapt_init(&hi);
+    int8_t fh[2]={0}; uint32_t rh[2]={0};
+    for(unsigned i=0;i<TIER_ADAPT_EVERY;i++){
+        hi.graduated++; fh[0]=1;
+        tier_evict(&hi,fh,2,rh,0,2); fh[0]=0;
+        tier_maybe_adapt(&hi);
+    }
+    if(hi.k!=TIER_K0+1) return fail("k did not rise on high graduation rate");
+    TierAdapt lo; tier_adapt_init(&lo);
+    for(unsigned i=0;i<TIER_ADAPT_EVERY;i++){
+        fh[0]=1; tier_evict(&lo,fh,2,rh,0,2); fh[0]=0;
+        tier_maybe_adapt(&lo);
+    }
+    if(lo.k!=TIER_K0-1) return fail("k did not fall on zero graduation rate");
     puts("tier tests: ok");
     return 0;
 }
