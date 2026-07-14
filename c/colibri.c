@@ -3729,12 +3729,12 @@ static void emit_stream(int t, void *ud){
     if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
         if(g_cache_route && e->m->route_slots){
             double swap=100.0*e->m->route_swaps/e->m->route_slots;
-            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, swap, e->count/(now_s()-e->t0),
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  k %.1f  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, ecache_k_avg(e->m), swap, e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         } else {
-            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
+            fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  k %.1f  %.2f tok/s  %.2f tok/fw]\n", e->count,
+                rss_gb(), tt?100.0*e->m->hits/tt:0.0, ecache_k_avg(e->m), e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         }
     }
