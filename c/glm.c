@@ -2919,16 +2919,43 @@ static double logprob_target(const float *lo, int V, int target, int *am){
     if(am)*am=(best==target);
     return (double)(lo[target]-mx) - log(se);
 }
+/* "glm" contenuto in model_type, case-insensitive — stessa regola di detect_prefix
+ * in tools/eval_glm.py (#194). Niente strcasestr: non esiste su MinGW/MSVC. */
+static int mt_is_glm(const char *s){
+    if(s) for(;*s;s++) if((s[0]|32)=='g'&&(s[1]|32)=='l'&&(s[2]|32)=='m') return 1;
+    return 0;
+}
 /* modalita' SCORING per i benchmark (stile lm-eval, log-likelihood):
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
  * Un solo forward per richiesta (teacher-forcing): niente generazione -> fattibile a bassa velocita'. */
-static void run_score(Model *m, const char *path){
+static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
+    /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
+     * scorare stream nudi e' out-of-distribution e deprime/distorce i punteggi. Se il config
+     * dice glm* gli id dei due token vengono chiesti al tokenizer.json dello snapshot (per
+     * GLM-5.2: 154822,154824 — mai fidarsi di costanti cablate, il vocabolario cambia tra
+     * release) e anteposti al CONTESTO delle richieste che non li hanno gia'; chi arriva GIA'
+     * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
+    int pfx[2]={-1,-1}, pfx_on=0;
+    if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
+        char *ar=NULL; jval *r=cfg_root(snap,&ar);
+        jval *mt=json_get(r,"model_type");
+        if(mt_is_glm(mt?mt->str:NULL)){
+            char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+            Tok T; tok_load(&T,tkp);
+            pfx[0]=tok_id_of(&T,"[gMASK]"); pfx[1]=tok_id_of(&T,"<sop>");
+            if(pfx[0]>=0&&pfx[1]>=0){ pfx_on=1;
+                fprintf(stderr,"[SCORE] GLM snapshot: prepending [gMASK]<sop> (ids %d,%d) to unprefixed requests — disable with SCORE_PREFIX=0\n",pfx[0],pfx[1]);
+            } else fprintf(stderr,"[SCORE] GLM config but tokenizer has no [gMASK]/<sop>: prefix OFF\n");
+        }
+        free(ar);
+    }
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
     int maxT=1; { char *ln=NULL; size_t cp=0;
         while(getline(&ln,&cp,f)>0){ int a,b; if(sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
         free(ln); }
+    if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
     int *ids=malloc(maxT*sizeof(int));
@@ -2937,6 +2964,10 @@ static void run_score(Model *m, const char *path){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
         if(T<=0||ctxlen<1){ printf("0 0 0\n"); fflush(stdout); continue; }
         for(int i=0;i<T;i++) ids[i]=strtol(p,&p,10);
+        if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* gia' prefissato -> intatto */
+            memmove(ids+2,ids,(size_t)T*sizeof(int));
+            ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
+        }
         for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
         layers_forward(m,x,T,0);
         double lp=0; int greedy=1;
@@ -4289,7 +4320,7 @@ int main(int argc, char **argv){
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
-    if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
     if(getenv("SERVE")){
