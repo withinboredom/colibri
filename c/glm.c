@@ -390,6 +390,8 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
             y[(int64_t)s*O+o]=a*sc; } }
 }
+static inline float siluf(float x);
+
 /* y[S,O] = x[S,I] @ W^T with W int4 packed (2/byte) + per-GROUP scales (fmt=4).
  * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
  * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
@@ -427,6 +429,58 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                 }
             }
             y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+/* Grouped-int4 expert gate + up + SwiGLU. Both projections share one OpenMP
+ * dispatch and each input load, then the activation is applied while the two
+ * accumulators are still hot. The per-projection accumulation order matches
+ * matmul_i4_grouped, so this is bit-identical to the unfused grouped path. */
+static void matmul_i4_grouped_swiglu(float *y, const float *x,
+                                     const uint8_t *qg, const float *sg,
+                                     const uint8_t *qu, const float *su,
+                                     int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wg=qg+(int64_t)o*rb, *wu=qu+(int64_t)o*rb;
+        const float *sgg=sg+(int64_t)o*ng, *sug=su+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float ag=0,au=0;
+            for(int g=0;g*gs<I;g++){
+                int base=g*gs,glen=gs; if(base+glen>I) glen=I-base;
+                float scg=sgg[g],scu=sug[g]; int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 accg=_mm256_setzero_ps(),accu=_mm256_setzero_ps();
+                for(;i+16<=base+glen;i+=16){
+                    __m128i byg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
+                    __m128i byu=_mm_loadl_epi64((const __m128i*)(wu+(i>>1)));
+                    __m128i log=_mm_and_si128(byg,m4),hig=_mm_and_si128(_mm_srli_epi16(byg,4),m4);
+                    __m128i lou=_mm_and_si128(byu,m4),hiu=_mm_and_si128(_mm_srli_epi16(byu,4),m4);
+                    __m128i ngb=_mm_unpacklo_epi8(log,hig),nub=_mm_unpacklo_epi8(lou,hiu);
+                    __m256 x0=_mm256_loadu_ps(xs+i),x1=_mm256_loadu_ps(xs+i+8);
+                    __m256 wg0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(ngb),b8));
+                    __m256 wg1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(ngb,8)),b8));
+                    __m256 wu0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nub),b8));
+                    __m256 wu1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nub,8)),b8));
+                    accg=_mm256_fmadd_ps(x0,wg0,accg); accg=_mm256_fmadd_ps(x1,wg1,accg);
+                    accu=_mm256_fmadd_ps(x0,wu0,accu); accu=_mm256_fmadd_ps(x1,wu1,accu);
+                }
+                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+#endif
+                for(;i<base+glen;i+=2){
+                    uint8_t bg=wg[i>>1],bu=wu[i>>1];
+                    if(i+1<base+glen){
+                        ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
+                        au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                    }else{
+                        ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
+                        au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                    }
+                }
+            }
+            y[(int64_t)s*O+o]=siluf(ag)*au;
         }
     }
 }
@@ -487,6 +541,14 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
     if(!g_no_fused_pair&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
+static void expert_swiglu(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
+    if(!g_no_fused_pair&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
+        matmul_i4_grouped_swiglu(g,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
+    else{
+        expert_gate_up(g,u,x,wg,wu,S);
+        for(int64_t z=0;z<(int64_t)S*wg->O;z++) g[z]=siluf(g[z])*u[z];
+    }
 }
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
@@ -3110,8 +3172,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+            expert_swiglu(gg,uu,xg,&e->g,&e->u,nr);
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3150,8 +3211,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        expert_swiglu(gg,uu,xg,&e->g,&e->u,nr);
                         matmul_qt(hh,gg,&e->d,nr);
                     }
                 }
