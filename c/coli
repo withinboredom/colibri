@@ -363,9 +363,13 @@ def cmd_info(a):
         row("model", a.model)
         row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
                     f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
-        sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
-        sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
-        row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
+        native=os.path.join(a.model,"model.coli")
+        if os.path.isfile(native):
+            row("container", f"native model.coli · {os.path.getsize(native)/1e9:.0f} GB on disk")
+        else:
+            sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
+            sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
+            row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
     else:
         print(f"   {C.yel}config.json is missing (incomplete conversion?){C.r}")
     try:
@@ -629,6 +633,15 @@ def cmd_convert(a):
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
+def cmd_pack(a):
+    banner("pack · native io_uring layout")
+    cmd=[sys.executable,os.path.join(TOOLS,"pack_native.py"),"--model",a.model]
+    if a.output: cmd += ["--output",a.output]
+    if a.delete_source: cmd.append("--delete-source")
+    if a.quick: cmd.append("--quick")
+    if a.force: cmd.append("--force")
+    sys.exit(subprocess.call(cmd))
+
 def main():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
@@ -681,10 +694,15 @@ def main():
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
+    pk=sub.add_parser("pack",parents=[common],help="compile safetensors into model.coli for one-SQE expert loads")
+    pk.add_argument("--output",default=None)
+    pk.add_argument("--delete-source",action="store_true",help="remove safetensors after full checksum verification")
+    pk.add_argument("--quick",action="store_true",help="skip full payload verification (incompatible with --delete-source)")
+    pk.add_argument("--force",action="store_true",help="replace an existing model.coli")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"pack":cmd_pack,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 

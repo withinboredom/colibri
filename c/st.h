@@ -32,6 +32,15 @@ typedef struct {
     int64_t numel;
 } st_tensor;
 
+/* Native model expert records. Each record is a pair of page-aligned regions:
+ * [gate/up/down weights | padding] [gate/up/down scales | padding]. io_uring
+ * can READV both regions into the final ESlot buffers with one SQE. */
+typedef struct {
+    int layer, n_experts, fmt, gs;
+    int64_t base, stride;
+    int64_t off[6], nbytes[6];
+} st_expert_layout;
+
 typedef struct {
     st_tensor *t;
     int        n, cap;
@@ -43,8 +52,22 @@ typedef struct {
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
                            * costava decine di secondi/token (misurato sul primo run reale) */
     int        hcap;
+    int        native_fd;
+    st_expert_layout *native_experts;
+    int        native_nexperts;
+    st_expert_layout *native_layer[256];
 } shards;
 #define ST_MAX_SHARDS 512
+#define ST_NATIVE_HEADER 64
+#define ST_NATIVE_TENSOR 48
+#define ST_NATIVE_EXPERT 128
+
+static uint32_t st_rd32(const unsigned char *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint64_t st_rd64(const unsigned char *p) {
+    return (uint64_t)st_rd32(p) | (uint64_t)st_rd32(p + 4) << 32;
+}
 
 static uint64_t st_hash(const char *s){
     uint64_t h=1469598103934665603ULL;
@@ -103,9 +126,119 @@ static int st_direct_fd(shards *S, int fd) {
     return -1;
 }
 
+static void st_build_hash(shards *S) {
+    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
+    S->hidx = malloc((size_t)S->hcap * sizeof(int));
+    if (!S->hidx) { perror("malloc tensor hash"); exit(1); }
+    for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
+    for (int i = 0; i < S->n; i++) {
+        uint64_t h = st_hash(S->t[i].name) & (uint64_t)(S->hcap - 1);
+        while (S->hidx[h] >= 0) {
+            if (!strcmp(S->t[S->hidx[h]].name, S->t[i].name)) {
+                fprintf(stderr, "duplicate tensor name: %s\n", S->t[i].name); exit(1); }
+            h = (h + 1) & (uint64_t)(S->hcap - 1);
+        }
+        S->hidx[h] = i;
+    }
+}
+
+static void st_native_init(shards *S, const char *path) {
+    int fd = st_open_fd(S, path); S->native_fd = fd;
+    struct stat sb;
+    if (fstat(fd, &sb)) { perror("fstat native model"); exit(1); }
+    int64_t fsz = (int64_t)sb.st_size;
+    unsigned char h[ST_NATIVE_HEADER];
+    if (pread(fd, h, sizeof(h), 0) != (ssize_t)sizeof(h)) { perror("pread native header"); exit(1); }
+    if (memcmp(h, "COLINAT1", 8) || st_rd32(h + 8) != 1) {
+        fprintf(stderr, "%s: unsupported native model format\n", path); exit(1); }
+    uint64_t declared = st_rd64(h + 16), nt = st_rd64(h + 24), ne = st_rd64(h + 32);
+    uint64_t ti = st_rd64(h + 40), ei = st_rd64(h + 48), data_start = st_rd64(h + 56);
+    if (declared != (uint64_t)fsz || nt > 10000000 || ne > 1024 ||
+        data_start < ST_NATIVE_HEADER || ti < data_start || ei < ti || ei > declared ||
+        ei - ti > (uint64_t)ST_MAX_HEADER) {
+        fprintf(stderr, "%s: invalid native model header\n", path); exit(1); }
+    size_t tibytes = (size_t)(ei - ti);
+    unsigned char *idx = malloc(tibytes ? tibytes : 1);
+    if (!idx) { perror("malloc native tensor index"); exit(1); }
+    if (tibytes && pread(fd, idx, tibytes, (off_t)ti) != (ssize_t)tibytes) {
+        perror("pread native tensor index"); exit(1); }
+    S->cap = S->n = (int)nt; S->t = calloc(nt ? (size_t)nt : 1, sizeof(st_tensor));
+    if (!S->t) { perror("calloc native tensors"); exit(1); }
+    size_t p = 0;
+    for (int i = 0; i < S->n; i++) {
+        if (p > tibytes || tibytes - p < ST_NATIVE_TENSOR) {
+            fprintf(stderr, "%s: truncated native tensor index\n", path); exit(1); }
+        unsigned char *e = idx + p;
+        uint32_t nl = st_rd32(e), dtype = st_rd32(e + 4);
+        uint64_t off = st_rd64(e + 8), nb = st_rd64(e + 16), numel = st_rd64(e + 24);
+        size_t padded = ((size_t)nl + 7) & ~(size_t)7;
+        if (!nl || nl > (1u << 20) || dtype > 3 || padded < nl ||
+            p + ST_NATIVE_TENSOR > tibytes || padded > tibytes - p - ST_NATIVE_TENSOR ||
+            off < data_start || nb > declared || off > declared - nb || numel > INT64_MAX) {
+            fprintf(stderr, "%s: invalid native tensor entry %d\n", path, i); exit(1); }
+        st_tensor *t = &S->t[i];
+        t->name = malloc((size_t)nl + 1);
+        if (!t->name) { perror("malloc native tensor name"); exit(1); }
+        memcpy(t->name, e + ST_NATIVE_TENSOR, nl); t->name[nl] = 0;
+        if (memchr(t->name, 0, nl)) {
+            fprintf(stderr, "%s: NUL in native tensor name\n", path); exit(1); }
+        t->fd = fd; t->off = (int64_t)off; t->nbytes = (int64_t)nb;
+        t->dtype = (int)dtype; t->numel = (int64_t)numel;
+        p += ST_NATIVE_TENSOR + padded;
+    }
+    if (p != tibytes) { fprintf(stderr, "%s: native tensor index size mismatch\n", path); exit(1); }
+    free(idx);
+
+    if (ne > SIZE_MAX / sizeof(st_expert_layout) ||
+        ne > ((uint64_t)fsz - ei) / ST_NATIVE_EXPERT) {
+        fprintf(stderr, "%s: invalid native expert index\n", path); exit(1); }
+    S->native_experts = calloc(ne ? (size_t)ne : 1, sizeof(st_expert_layout));
+    if (!S->native_experts) { perror("calloc native expert layouts"); exit(1); }
+    S->native_nexperts = (int)ne;
+    for (int i = 0; i < S->native_nexperts; i++) {
+        unsigned char e[ST_NATIVE_EXPERT];
+        if (pread(fd, e, sizeof(e), (off_t)(ei + (uint64_t)i * sizeof(e))) != (ssize_t)sizeof(e)) {
+            perror("pread native expert layout"); exit(1); }
+        st_expert_layout *x = &S->native_experts[i];
+        x->layer = (int)st_rd32(e); x->n_experts = (int)st_rd32(e + 4);
+        x->base = (int64_t)st_rd64(e + 8); x->stride = (int64_t)st_rd64(e + 16);
+        for (int k = 0; k < 6; k++) x->off[k] = (int64_t)st_rd64(e + 24 + k * 8);
+        for (int k = 0; k < 6; k++) x->nbytes[k] = (int64_t)st_rd64(e + 72 + k * 8);
+        x->fmt = (int)st_rd32(e + 120); x->gs = (int)st_rd32(e + 124);
+        if (x->layer < 0 || x->layer >= 256 || S->native_layer[x->layer] ||
+            x->n_experts < 1 || x->base < (int64_t)data_start ||
+            x->stride < 4096 || (x->base & 4095) || (x->stride & 4095) ||
+            x->base > fsz - x->stride || x->n_experts > (fsz - x->base) / x->stride ||
+            x->fmt < 1 || x->fmt > 4) {
+            fprintf(stderr, "%s: invalid native expert layout %d\n", path, i); exit(1); }
+        for (int k = 0; k < 6; k++) if (x->off[k] < 0 || x->nbytes[k] < 0 ||
+            x->off[k] > x->stride - x->nbytes[k]) {
+            fprintf(stderr, "%s: native expert field outside record\n", path); exit(1); }
+        if ((x->off[3] & 4095) || x->off[0] + x->nbytes[0] > x->off[3] ||
+            x->off[1] + x->nbytes[1] > x->off[3] || x->off[2] + x->nbytes[2] > x->off[3] ||
+            x->off[4] < x->off[3] || x->off[5] < x->off[3]) {
+            fprintf(stderr, "%s: invalid native expert weight/scale regions\n", path); exit(1); }
+        S->native_layer[x->layer] = x;
+    }
+    st_build_hash(S);
+    fprintf(stderr, "[NATIVE] %d tensors, %d expert layouts from model.coli\n", S->n, S->native_nexperts);
+}
+
+static st_expert_layout *st_native_expert(shards *S, int layer) {
+    return layer >= 0 && layer < 256 ? S->native_layer[layer] : NULL;
+}
+
 /* indicizza tutti i model-*.safetensors in snap_dir */
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
+    S->native_fd = -1;
+    char native_path[2048];
+    if (snprintf(native_path, sizeof(native_path), "%s/model.coli", snap_dir) >= (int)sizeof(native_path)) {
+        fprintf(stderr, "model path too long\n"); exit(1); }
+    struct stat native_stat;
+    if (!stat(native_path, &native_stat) && S_ISREG(native_stat.st_mode)) {
+        st_native_init(S, native_path); return;
+    }
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
@@ -177,14 +310,7 @@ static void st_init(shards *S, const char *snap_dir) {
         free(hdr);
     }
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
-    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
-    S->hidx = malloc(S->hcap * sizeof(int));
-    for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
-    for (int i = 0; i < S->n; i++) {
-        uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
-        while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
-        S->hidx[h] = i;
-    }
+    st_build_hash(S);
 }
 
 static st_tensor *st_find(shards *S, const char *name) {

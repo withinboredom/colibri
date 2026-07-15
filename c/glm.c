@@ -139,7 +139,7 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used; int native_buf; } ESlot;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -1766,11 +1766,12 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #define URING_LOAD_MAX 64
 #define URING_REQ_MAX  512
 typedef struct {
-    int load, expect;
+    int load, expect; struct iovec iov[2];
 } UringRead;
 typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
     st_tensor *tw[3],*tq[3]; int64_t pos[3];
+    st_expert_layout *native;
     int pending,done,finalized,error;
 } UringLoad;
 typedef struct {
@@ -1798,8 +1799,18 @@ static int uring_add_read(UringBatch *b,int li,int fd,void *buf,size_t len,
                           int64_t off,size_t expect){
     if(b->nreq>=URING_REQ_MAX || expect>INT_MAX){ errno=E2BIG; return -1; }
     int ri=b->nreq++;
-    b->req[ri]=(UringRead){li,(int)expect};
+    b->req[ri]=(UringRead){.load=li,.expect=(int)expect};
     if(coli_uring_prep_read(&b->ring,fd,buf,len,off,(uint64_t)ri+1)) return -1;
+    b->load[li].pending++;
+    return 0;
+}
+static int uring_add_readv(UringBatch *b,int li,int fd,void *wbuf,size_t wlen,
+                           void *sbuf,size_t slen,int64_t off,size_t expect){
+    if(b->nreq>=URING_REQ_MAX || expect>INT_MAX){ errno=E2BIG; return -1; }
+    int ri=b->nreq++;
+    UringRead *r=&b->req[ri]; r->load=li; r->expect=(int)expect;
+    r->iov[0]=(struct iovec){wbuf,wlen}; r->iov[1]=(struct iovec){sbuf,slen};
+    if(coli_uring_prep_readv(&b->ring,fd,r->iov,2,off,(uint64_t)ri+1)) return -1;
     b->load[li].pending++;
     return 0;
 }
@@ -1810,14 +1821,62 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int li=b->nload++;
     UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
+#ifdef COLI_CUDA
+    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+    st_expert_layout *native=st_native_expert(&m->S,layer);
+    if(native){
+        if(eid<0 || eid>=native->n_experts)
+            return uring_load_error(l,EINVAL,"io_uring native expert id"),li;
+        int64_t wspan=native->off[3], sspan=native->stride-wspan;
+        if(wspan<=0 || sspan<=0 || (wspan&4095) || (sspan&4095))
+            return uring_load_error(l,EINVAL,"io_uring native expert layout"),li;
+        if(!s->slab || wspan>s->slab_cap){
+#ifdef COLI_METAL
+            if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
+#endif
+            compat_aligned_free(s->slab);
+            if(posix_memalign((void**)&s->slab,4096,(size_t)wspan)){
+                s->slab=NULL; s->slab_cap=0;
+                return uring_load_error(l,ENOMEM,"io_uring native expert weights"),li; }
+            s->slab_cap=wspan;
+#ifdef COLI_METAL
+            if(g_metal_enabled) coli_metal_register(s->slab,(size_t)wspan);
+#endif
+        }
+        if(!s->native_buf || !s->fslab || sspan/4>s->fslab_cap){
+#ifdef COLI_METAL
+            if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
+#endif
+            free(s->fslab); s->fslab=NULL;
+            if(posix_memalign((void**)&s->fslab,4096,(size_t)sspan)){
+                s->fslab_cap=0; s->native_buf=0;
+                return uring_load_error(l,ENOMEM,"io_uring native expert scales"),li; }
+            s->fslab_cap=sspan/4; s->native_buf=1;
+#ifdef COLI_METAL
+            if(g_metal_enabled) coli_metal_register(s->fslab,(size_t)sspan);
+#endif
+        }
+        int fd=m->S.native_fd, dfd=g_direct?st_direct_fd(&m->S,fd):-1;
+        if(dfd>=0) fd=dfd;
+        int64_t off=native->base+(int64_t)eid*native->stride;
+        l->native=native;
+        if(uring_add_readv(b,li,fd,s->slab,(size_t)wspan,s->fslab,(size_t)sspan,
+                           off,(size_t)native->stride))
+            return uring_load_error(l,errno,"io_uring native expert read"),li;
+        if(g_disk_split){
+            if(layer==m->c.n_layers){ __atomic_add_fetch(&m->ld_mtp,1,__ATOMIC_RELAXED);
+                                      __atomic_add_fetch(&m->bytes_mtp,(uint64_t)native->stride,__ATOMIC_RELAXED); }
+            else                    { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED);
+                                      __atomic_add_fetch(&m->bytes_main,(uint64_t)native->stride,__ATOMIC_RELAXED); }
+        }
+        return li;
+    }
     char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(g_mmap || !st_has(&m->S,qn))
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
-#ifdef COLI_CUDA
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
-#endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
         size_t n=strnlen(nm[k],sizeof(nm[k]));
@@ -1918,6 +1977,20 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     UringLoad *l=&b->load[li]; ESlot *s=l->s;
     if(l->finalized) return 0;
     if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(l->native){
+        st_expert_layout *n=l->native;
+        if(g_drop) posix_fadvise(l->m->S.native_fd,n->base+(int64_t)l->eid*n->stride,
+                                 n->stride,POSIX_FADV_DONTNEED);
+        Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
+        QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+        for(int k=0;k<3;k++){
+            qt[k]->fmt=n->fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=n->gs; qt[k]->qf=NULL;
+            qt[k]->q8=(int8_t*)(s->slab+n->off[k]); qt[k]->q4=s->slab+n->off[k];
+            qt[k]->s=(float*)((char*)s->fslab+n->off[k+3]-n->off[3]);
+        }
+        if(publish_eid) s->eid=l->eid;
+        l->finalized=1; return 0;
+    }
     if(g_drop){
         int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
         int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
@@ -1930,7 +2003,12 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
         int64_t nb=l->tw[k]->nbytes;
         int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        int gs=0;
+        if(fmt==2 && l->tq[k]->nbytes>(int64_t)OO[k]*4){
+            int ng128=(II[k]+127)/128;
+            if(l->tq[k]->nbytes==(int64_t)OO[k]*ng128*4){fmt=4;gs=128;}
+        }
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
     if(publish_eid) s->eid=l->eid;
@@ -5665,6 +5743,10 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+#ifdef __linux__
+    if(g_uring && m.S.native_nexperts)
+        fprintf(stderr,"[URING] native model.coli: one aligned READV SQE per expert miss\n");
+#endif
     if(g_draft<0){
 #ifdef COLI_CUDA
         g_draft = (m.has_mtp&&!g_cuda_enabled) ? 3 : 0;

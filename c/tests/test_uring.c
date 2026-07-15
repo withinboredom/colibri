@@ -66,6 +66,33 @@ static int test_expert_layout(int fd){
     return bad?fail("pilot uring publication"):0;
 }
 
+static int test_native_expert_layout(int fd){
+    Model m={0}; ESlot slot={0}; UringBatch batch={0}; st_expert_layout layout={0};
+    m.c.hidden=4; m.c.moe_inter=3; m.ebits=8;
+    m.S.native_fd=fd; m.S.native_experts=&layout; m.S.native_nexperts=1; m.S.native_layer[1]=&layout;
+    layout.layer=1; layout.n_experts=8; layout.base=0; layout.stride=8192;
+    layout.fmt=4; layout.gs=128;
+    int64_t lengths[6]={6,6,8,12,12,16};
+    layout.off[0]=0; layout.off[1]=6; layout.off[2]=12;
+    layout.off[3]=4096; layout.off[4]=4108; layout.off[5]=4120;
+    memcpy(layout.nbytes,lengths,sizeof(lengths));
+    unsigned char weights[20]; for(int i=0;i<20;i++) weights[i]=(unsigned char)(i+3);
+    float scales[10]; for(int i=0;i<10;i++) scales[i]=(float)i+1.25f;
+    if(ftruncate(fd,8192) || pwrite(fd,weights,sizeof(weights),0)!=(ssize_t)sizeof(weights) ||
+       pwrite(fd,scales,sizeof(scales),4096)!=(ssize_t)sizeof(scales)) return fail("native fixture write");
+    if(uring_batch_init(&batch)) return fail("native expert ring init");
+    uring_batch_reset(&batch);
+    int li=uring_load_add(&batch,&m,1,0,&slot,1);
+    if(li!=0 || batch.nreq!=1 || uring_submit_batch(&batch) || uring_finalize_load(&batch,li,1)){
+        coli_uring_close(&batch.ring); return fail("native expert batch load"); }
+    int bad=slot.eid!=0 || slot.g.fmt!=4 || slot.g.gs!=128 ||
+        memcmp(slot.g.q4,weights,6) || memcmp(slot.u.q4,weights+6,6) ||
+        memcmp(slot.d.q4,weights+12,8) || memcmp(slot.g.s,scales,12) ||
+        memcmp(slot.u.s,scales+3,12) || memcmp(slot.d.s,scales+6,16);
+    coli_uring_close(&batch.ring); compat_aligned_free(slot.slab); free(slot.fslab);
+    return bad?fail("native expert tensor views"):0;
+}
+
 int main(void){
     char path[]="/tmp/coli-uring-XXXXXX";
     int fd=mkstemp(path); if(fd<0) return fail("mkstemp");
@@ -111,7 +138,7 @@ int main(void){
         coli_uring_close(&ring); close(fd); return fail("read data mismatch");
     }
     coli_uring_close(&ring);
-    if(ftruncate(fd,0) || test_expert_layout(fd)){ close(fd); return 1; }
+    if(ftruncate(fd,0) || test_expert_layout(fd) || test_native_expert_layout(fd)){ close(fd); return 1; }
     close(fd);
     puts("test_uring: ok"); return 0;
 }

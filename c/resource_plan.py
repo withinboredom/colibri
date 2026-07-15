@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from native_format import read_native
+
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
@@ -40,20 +42,29 @@ def analyze_model(model):
     if not config_path.is_file():
         raise ValueError(f"missing config.json: {model}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    shards = sorted(model.glob("*.safetensors"))
-    if not shards:
-        raise ValueError(f"no safetensors shards: {model}")
+    native_path = model / "model.coli"
+    if native_path.is_file():
+        native = read_native(native_path)
+        sources = [(item["name"], item["nbytes"]) for item in native["tensors"]]
+        shard_count = 1
+        model_bytes = native["file_size"]
+    else:
+        shards = sorted(model.glob("*.safetensors"))
+        if not shards:
+            raise ValueError(f"no model.coli or safetensors shards: {model}")
+        sources = ((name, size) for shard in shards for name, size in _tensor_sizes(shard))
+        shard_count = len(shards)
+        model_bytes = sum(shard.stat().st_size for shard in shards)
 
     dense_bytes = 0
     expert_groups = {}
-    for shard in shards:
-        for name, size in _tensor_sizes(shard):
-            match = EXPERT_RE.search(name)
-            if match:
-                key = tuple(map(int, match.groups()))
-                expert_groups[key] = expert_groups.get(key, 0) + size
-            else:
-                dense_bytes += size
+    for name, size in sources:
+        match = EXPERT_RE.search(name)
+        if match:
+            key = tuple(map(int, match.groups()))
+            expert_groups[key] = expert_groups.get(key, 0) + size
+        else:
+            dense_bytes += size
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
@@ -61,10 +72,9 @@ def analyze_model(model):
     per_layer = {layer: int(statistics.median(sizes)) for layer, sizes in layer_sizes.items()}
     per_cap_bytes = sum(per_layer.values())
     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
-    model_bytes = sum(shard.stat().st_size for shard in shards)
     return {
         "path": str(model),
-        "shards": len(shards),
+        "shards": shard_count,
         "model_bytes": model_bytes,
         "dense_bytes": dense_bytes,
         "expert_bytes": sum(expert_groups.values()),
