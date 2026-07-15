@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifndef MAP_POPULATE
@@ -106,6 +107,27 @@ static inline int coli_uring_prep_read(ColiUring *r,int fd,void *buf,size_t len,
     sqe->off=(uint64_t)off;
     sqe->addr=(uint64_t)(uintptr_t)buf;
     sqe->len=(uint32_t)len;
+    sqe->user_data=user_data;
+    r->sq_array[idx]=idx;
+    coli_uring_store_release(r->sq_tail,tail+1);
+    return 0;
+}
+
+static inline int coli_uring_prep_readv(ColiUring *r,int fd,const struct iovec *iov,
+                                        unsigned iovcnt,int64_t off,uint64_t user_data){
+    if(!iov || !iovcnt){ errno=EINVAL; return -1; }
+    unsigned head=coli_uring_load_acquire(r->sq_head);
+    unsigned tail=__atomic_load_n(r->sq_tail,__ATOMIC_RELAXED);
+    if(tail-head>=*r->sq_entries){ errno=EAGAIN; return -1; }
+    unsigned idx=tail&*r->sq_mask;
+    struct io_uring_sqe *sqe=&r->sqes[idx];
+    memset(sqe,0,sizeof(*sqe));
+    sqe->opcode=IORING_OP_READV;
+    sqe->flags=IOSQE_ASYNC;
+    sqe->fd=fd;
+    sqe->off=(uint64_t)off;
+    sqe->addr=(uint64_t)(uintptr_t)iov;
+    sqe->len=iovcnt;
     sqe->user_data=user_data;
     r->sq_array[idx]=idx;
     coli_uring_store_release(r->sq_tail,tail+1);

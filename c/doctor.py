@@ -109,7 +109,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=detected_gpus)
         model_info = plan["model"]
-        checks.append(_check("model.shards", "pass", "safetensors headers are valid",
+        checks.append(_check("model.shards", "pass", "model container indexes are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
         disk = plan["tiers"]["disk"]
         disk_status = "warn" if disk["available_bytes"] < GB else "pass"

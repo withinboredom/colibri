@@ -123,8 +123,13 @@ cd c
 # Conversion (only) needs python with: pip install torch safetensors huggingface_hub numpy
 ./coli convert --model /nvme/glm52_i4     # ~400 GB free on a real ext4/NVMe path
 
+# Optional Linux io_uring-native layout: one aligned SQE per expert miss.
+# --delete-source removes safetensors only after rereading and checksumming model.coli.
+# The safe transactional build temporarily needs space for both representations.
+./coli pack --model /nvme/glm52_i4 --delete-source
+
 # chat — RAM budget, expert cache and MTP are all detected automatically:
-COLI_MODEL=/nvme/glm52_i4 ./coli chat
+URING=1 DIRECT=1 COLI_MODEL=/nvme/glm52_i4 ./coli chat
 ```
 
 Inspect the planned storage hierarchy before loading the model:
@@ -137,7 +142,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli plan --gpu 0,1 --ram 128 --vram 48 --json
 COLI_MODEL=/nvme/glm52_i4 ./coli chat --auto-tier
 ```
 
-`coli plan` reads only safetensors headers and reports the model's exact dense/expert
+`coli plan` reads only safetensors headers or the native `model.coli` index and reports the model's exact dense/expert
 footprint, runtime RAM reserve, safe expert-cache cap, and bounded VRAM hot tier. Its
 versioned JSON output is intended to be shared by the CLI, API server, Web UI, and
 desktop shell; it does not allocate model tensors or start inference.
@@ -154,7 +159,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --gpu 0 --ram 128 --json
 ```
 
-Doctor validates the model directory, config, tokenizer, safetensors headers,
+Doctor validates the model directory, config, tokenizer, model-container indexes,
 engine executable, available RAM, requested NVIDIA devices, CUDA linkage, and the
 same placement budget used by `coli plan`. It never starts `glm`, reads tensor
 payloads, imports a model framework, or creates a CUDA context. The versioned JSON
