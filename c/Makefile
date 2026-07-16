@@ -197,7 +197,7 @@ endif
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
 METAL_OBJ  =
-METALXX    = clang++ -x objective-c++ -fobjc-arc -O3
+METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
