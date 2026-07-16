@@ -34,6 +34,9 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#ifdef __linux__
+#include <sys/syscall.h>                          /* COLI_NUMA: mbind degli slab expert / expert-slab interleave */
+#endif
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
@@ -1159,13 +1162,48 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
                           * non vengono stampate. Solo misura: nessun effetto sull'output. */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
  * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
+/* ---- COLI_NUMA=1 (#82): interleave the expert slabs across NUMA nodes ----
+ * On multi-socket hosts first-touch parks nearly the whole pin+LRU on the loader
+ * thread's node (measured: node0 766MB free / node1 idle), and every far-socket
+ * core then streams weights over the interconnect. Interleaving ONLY the expert
+ * slabs recruits all memory controllers: +7%/-14% expert-matmul on 2 sockets,
+ * +40% on a 4-socket (#82). Blanket `numactl --interleave=all` is NOT equivalent:
+ * it also interleaves the CUDA pinned staging buffers and cost a 4-socket GPU host
+ * 10x (#82) — hence per-region mbind here and nothing else. Raw syscall, no libnuma
+ * dependency; MPOL_MF_MOVE migrates pages of reused heap chunks too. Linux-only,
+ * silent no-op elsewhere or on single-node hosts. */
+static int g_numa_nodes=0;
+static void numa_slab_bind(void *p, size_t n){
+#ifdef __linux__
+    if(g_numa_nodes<2 || !p || !n) return;
+    unsigned long mask=(1UL<<g_numa_nodes)-1;
+    uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
+    size_t len=((uintptr_t)p+n+4095 & ~(uintptr_t)4095) - a;
+    syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
+            (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
+#else
+    (void)p;(void)n;
+#endif
+}
+static void numa_init(void){
+#ifdef __linux__
+    if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
+    for(int i=0;i<64;i++){ char pth[64]; snprintf(pth,sizeof(pth),"/sys/devices/system/node/node%d",i);
+        struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
+    if(g_numa_nodes>=2) fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
+    else fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n");
+#endif
+}
+
 static void *qalloc(size_t n){
 #ifdef COLI_METAL
     if(g_metal_enabled){ void *p; size_t r=(n+16383)&~(size_t)16383;
         if(posix_memalign(&p,16384,r)){fprintf(stderr,"OOM qalloc\n");exit(1);}
         coli_metal_register(p,r); return p; }
 #endif
-    return malloc(n);
+    void *p=malloc(n);
+    if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
+    return p;
 }
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
 static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
@@ -1759,6 +1797,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
+        numa_slab_bind(s->slab,(size_t)s->slab_cap);
 #endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
@@ -1790,6 +1829,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             }
         }
         s->fslab_cap=ftot;
+        numa_slab_bind(s->fslab,(size_t)ftot*sizeof(float));
 #endif
     }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
@@ -5810,6 +5850,7 @@ int main(int argc, char **argv){
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
+    numa_init();                                       /* COLI_NUMA=1: expert-slab interleave (#82) */
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     /* EXPERT_BUDGET e' sotto quarantena: la finestra operativa e' misurata VUOTA.
