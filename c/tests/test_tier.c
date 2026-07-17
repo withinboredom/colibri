@@ -55,6 +55,16 @@ int main(void){
     if(f2[1]!=0) return fail("oldest existing ghost not trimmed to make room");
     if(f2[2]!=-5) return fail("younger existing ghost lost wrongly");
 
+    /* live-freq decay: every TIER_DECAY_EVERY evictions the live freqs halve,
+     * so protection expires unless re-earned; ghosts and freq-1 are exempt */
+    TierAdapt dc; tier_adapt_init(&dc);
+    int8_t fd[5]={0}; uint32_t rd[5]={0};
+    fd[1]=8; fd[2]=TIER_FMAX; fd[3]=-6; fd[4]=1;   /* live, saturated, ghost, floor */
+    for(unsigned i=0;i<TIER_DECAY_EVERY;i++){ fd[0]=1; tier_evict(&dc,fd,5,rd,0,5); fd[0]=0; }
+    if(fd[1]!=4 || fd[2]!=TIER_FMAX/2) return fail("live freqs did not halve on the decay cadence");
+    if(fd[3]!=-6) return fail("ghost freq must not decay");
+    if(fd[4]!=1) return fail("freq 1 must not decay");
+
     /* k adaptation: high graduation rate raises k, zero rate lowers it —
      * but only on a COMPLETED hit-rate window (the change->measure->learn
      * gate), never on eviction pressure alone. */

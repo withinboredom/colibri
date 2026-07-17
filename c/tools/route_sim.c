@@ -21,6 +21,8 @@
  *   -c  streaming-cache slots per layer (mirror the runtime's ecap)
  *   -p  pin the N most-requested experts per layer (approximates VRAM pins:
  *       kept in the 64-block layout, never enter the streaming cache)
+ * The clox column replays tier.h verbatim, including its built-in live-freq
+ * decay; to sweep the decay cadence, rebuild with -DTIER_DECAY_EVERY=n.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,7 +214,8 @@ int main(int argc, char **argv){
     fclose(f);
     if(maxlayer<0){ fprintf(stderr,"empty trace\n"); return 1; }
 
-    printf("route_sim: cap=%d pins/layer=%d experts=%d\n",cap,npin,nexp);
+    printf("route_sim: cap=%d pins/layer=%d experts=%d decay_every=%u\n",
+           cap,npin,nexp,(unsigned)TIER_DECAY_EVERY);
     printf("%5s %10s %6s | %6s %6s %7s %6s %7s | %6s %6s %7s %6s %7s\n",
            "layer","probes","opt%","lru%","x-opt%","sub%","ret%","ttr",
            "clox%","x-opt%","sub%","ret%","ttr");
