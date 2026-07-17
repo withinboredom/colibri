@@ -100,6 +100,7 @@ static void run_online(const LT *t, const uint32_t *pr, const size_t *pcs, int n
     uint64_t *used=xrealloc(NULL,cap*sizeof *used);
     int *rs=xrealloc(NULL,nexp*sizeof *rs);            /* expert -> slot | -1 */
     int8_t *freq=calloc(nexp,1);
+    unsigned char *gb=calloc(nexp,1);   /* graduated-this-residency (clox==2) */
     uint32_t *last=calloc(nexp,sizeof *last);
     for(int e=0;e<nexp;e++) rs[e]=-1;
     TierAdapt ad; tier_adapt_init(&ad);
@@ -120,7 +121,15 @@ static void run_online(const LT *t, const uint32_t *pr, const size_t *pcs, int n
                 int e=(int)v;
                 if(rs[e]>=0){
                     s->hits++; used[rs[e]]=++eclock;
-                    if(clox){ tier_touch(&ad,&freq[e],nn>=cap); tier_probe(&ad,1); }
+                    if(clox==1){ tier_touch(&ad,&freq[e],nn>=cap); tier_probe(&ad,1); }
+                    else if(clox==2){          /* -g: graduate once per residency */
+                        int8_t fv=freq[e];
+                        if(fv>=1&&fv<TIER_FMAX){
+                            if(fv==ad.k && nn>=cap && !gb[e]){ ad.graduated++; gb[e]=1; }
+                            freq[e]=(int8_t)(fv+1);
+                        }
+                        tier_probe(&ad,1);
+                    }
                 }else{
                     s->miss++; missb[nmiss++]=e;
                     if(clox) tier_probe(&ad,0);
@@ -143,12 +152,12 @@ static void run_online(const LT *t, const uint32_t *pr, const size_t *pcs, int n
                     rs[vict]=-1;
                 }
                 seid[slot]=e; rs[e]=slot; used[slot]=++eclock;
-                if(clox) tier_admit(&freq[e]);
+                if(clox){ tier_admit(&freq[e]); gb[e]=0; }
             }
         }
     }
     if(ad_out) *ad_out=ad;
-    free(seid); free(used); free(rs); free(freq); free(last);
+    free(seid); free(used); free(rs); free(freq); free(gb); free(last);
 }
 
 /* Belady with bypass, probe by probe: the miss-count lower bound */
@@ -181,10 +190,11 @@ static double pct(unsigned long long a, unsigned long long b){ return b? 100.0*(
 static double xopt(const PS *p, const PS *o){ return o->miss? 100.0*((double)p->miss-(double)o->miss)/(double)o->miss : 0.0; }
 
 int main(int argc, char **argv){
-    int cap=0, npin=0; const char *path=NULL;
+    int cap=0, npin=0, gonce=0; const char *path=NULL;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-c")&&i+1<argc) cap=atoi(argv[++i]);
         else if(!strcmp(argv[i],"-p")&&i+1<argc) npin=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"-g")) gonce=1;    /* clox: graduate once per residency */
         else path=argv[i];
     }
     if(!path||cap<1){ fprintf(stderr,"usage: route_sim -c CAP [-p NPIN] trace\n"); return 2; }
@@ -237,7 +247,8 @@ int main(int argc, char **argv){
         memset(pinned,0,nexp);
         for(int a=0;a<npin;a++){ int best=-1;
             for(int e=0;e<nexp;e++) if(!pinned[e]&&cnt[e]&&(best<0||cnt[e]>cnt[best])) best=e;
-            if(best<0) break; pinned[best]=1; }
+            if(best<0) break;
+            pinned[best]=1; }
         /* probe stream: per call, uniques in first-appearance order (pinned flagged) */
         uint32_t *pr=xrealloc(NULL,t->nr*sizeof *pr); size_t np=0;
         size_t *pcs=xrealloc(NULL,(t->nc+1)*sizeof *pcs);
@@ -267,7 +278,7 @@ int main(int argc, char **argv){
         PS o,lr,cx; TierAdapt ad; unsigned long long prot=0;
         memcpy(cur,off,nexp*sizeof *cur); run_opt(pr,np,nexp,cap,occ,off,cur,&o);
         memcpy(cur,off,nexp*sizeof *cur); run_online(t,pr,pcs,nexp,cap,occ,off,cur,0,&lr,NULL,NULL);
-        memcpy(cur,off,nexp*sizeof *cur); run_online(t,pr,pcs,nexp,cap,occ,off,cur,1,&cx,&ad,&prot);
+        memcpy(cur,off,nexp*sizeof *cur); run_online(t,pr,pcs,nexp,cap,occ,off,cur,gonce?2:1,&cx,&ad,&prot);
 
         unsigned long long probes=o.hits+o.miss;
         printf("%5d %10llu %6.1f | %6.1f %6.1f %6.1f%% %5.1f%% %7.0f | %6.1f %6.1f %6.1f%% %5.1f%% %7.0f\n",
