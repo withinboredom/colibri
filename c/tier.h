@@ -55,13 +55,19 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
 
 /* ---- streaming-cache policy: adaptive frequency protection (SLRU) ----
  * Per-expert frequency with a deliberate lifecycle: freq saturates at
- * TIER_FMAX and is NEVER decayed while live — forgetting happens only through
- * the bounded ghost turnover in tier_evict, at a rate proportional to real
- * eviction traffic (never wall-clock or periodic halving). Victims are LRU
- * among experts at freq <= k; k self-tunes from the graduation rate (of the
- * experts evicted under pressure, what fraction first proved reuse by
- * crossing k), and the graduation-rate thresholds themselves self-tune from
- * a hit-rate gradient. Only the adaptation statistics are ever halved. */
+ * TIER_FMAX and decays by halving every TIER_DECAY_EVERY evictions, so
+ * protection must be RE-EARNED on the cache-turnover timescale. Forgetting
+ * is eviction-driven, never wall-clock: a parked layer forgets nothing.
+ * Without decay, residents that saturated freq while hot squat on slots
+ * after the working set drifts — measured against Belady on real routing
+ * traces (tools/route_sim), undecayed protection loses to plain LRU at
+ * cap>=8, while halving every ~16 evictions dominates LRU at every
+ * capacity/pinning level tested; decaying too fast merely degrades INTO
+ * LRU, never below it. Victims are LRU among experts at freq <= k; k
+ * self-tunes from the graduation rate (of the experts evicted under
+ * pressure, what fraction first proved reuse by crossing k), and the
+ * graduation-rate thresholds themselves self-tune from a hit-rate
+ * gradient. */
 
 #define TIER_FMAX          15   /* freq saturation */
 #define TIER_K0             2   /* initial protection bar */
@@ -76,12 +82,18 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
 #define TIER_RATE_HIGH_MIN 3000u
 #define TIER_RATE_HIGH_MAX 8000u
 #define TIER_RATE_STEP     1000u
+#ifndef TIER_DECAY_EVERY        /* overridable (-D...) so route_sim can sweep it */
+#define TIER_DECAY_EVERY   16u  /* evictions between live-freq halvings — the
+                                 * route_sim optimum plateau is 8-24 across all
+                                 * pinning levels; 16 shares the adapt cadence */
+#endif
 
 typedef struct {
     int8_t k, last_dir;
     uint32_t ev_unprot, ev_prot, graduated, last_check;
     uint32_t rate_low, rate_high;      /* learned thresholds, x10000 */
     uint32_t win_hits, win_ops, prev_hitrate;
+    uint32_t decay_ctr;                /* evictions since the last live-freq halving */
 } TierAdapt;
 
 static void tier_adapt_init(TierAdapt *a){
@@ -89,6 +101,7 @@ static void tier_adapt_init(TierAdapt *a){
     a->ev_unprot=a->ev_prot=a->graduated=a->last_check=0;
     a->rate_low=TIER_RATE_LOW0; a->rate_high=TIER_RATE_HIGH0;
     a->win_hits=a->win_ops=a->prev_hitrate=0;
+    a->decay_ctr=0;
 }
 
 /* every streamed-cache probe (hit or miss) feeds the hit-rate window */
@@ -126,6 +139,13 @@ static void tier_evict(TierAdapt *a, int8_t *freq, int nexpert,
     }
     if(ng>=ghost_cap && old>=0) freq[old]=0;
     if(freq[eid]>0) freq[eid]=(int8_t)-freq[eid];
+    /* live-freq decay on the eviction clock: halve so protection expires
+     * unless re-earned. Ghosts (negative) keep their remembered freq — their
+     * forgetting is the census turnover above; freq 1 has nothing to lose. */
+    if(++a->decay_ctr>=TIER_DECAY_EVERY){
+        a->decay_ctr=0;
+        for(int e=0;e<nexpert;e++) if(freq[e]>1) freq[e]/=2;
+    }
 }
 
 /* Two feedback loops: the graduation rate drives k, and the hit-rate gradient
