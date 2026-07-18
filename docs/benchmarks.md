@@ -116,8 +116,12 @@ can match an RTX 5090 on expert matmul ([#101](https://github.com/JustVugg/colib
 so **the GPU tier earns its VRAM only when the CPU is the weak link**. On
 multi-socket hosts, NUMA placement is a further lever: interleaving the resident
 weights across nodes measured **+13% (2-socket) and +40% (4-socket CPU-only)**
-([#82](https://github.com/JustVugg/colibri/issues/82)) — but never blanket-interleave
-a GPU host (measured 10× regression via the DMA staging pages).
+([#82](https://github.com/JustVugg/colibri/issues/82)). On a 2-socket Xeon Silver
+4510 host with 6× RTX 5090, selective `COLI_NUMA=1` raised effective CPU-expert
+bandwidth from **42.42 to 58.26/65.89 GB/s** and greedy decode from **7.66 to
+9.02/9.17 tok/s** (64 tokens, `TEMP=0 DRAFT=0`, byte-identical output). Do not
+blanket-interleave a GPU host: it also spreads DMA staging pages and has measured
+up to a 10× regression; generated plans enable only the selective slab policy.
 
 ## Quality benchmark
 
