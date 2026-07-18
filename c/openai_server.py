@@ -406,7 +406,10 @@ def generation_options(body, limit):
         maximum = body.get("max_tokens")
         maximum_param = "max_tokens"
     if maximum is None:
-        maximum = min(256, limit)
+        # Client omitted max_tokens: honor the operator's configured budget (--max-tokens /
+        # --ngen), not an arbitrary 256 — `coli serve --ngen 32768` must mean 32768 (#382).
+        # Generation still ends at EOS, so this is a cap, not a target.
+        maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
     temperature = 0.7 if temperature is None else temperature

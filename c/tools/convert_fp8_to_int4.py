@@ -299,6 +299,16 @@ def main():
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
 
+    # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
+    # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
+    # gated su bits<=4 — combinazioni sorprendenti devono mostrarsi al secondo 1 di un job
+    # da ore, non nel size-check dopo. EN: print the RESOLVED plan before doing anything.
+    mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
+    grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
+          (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
+    print(f"[PLAN] mode: {mode} | source: {'local ' + a.indir if a.indir else 'download ' + a.repo} | "
+          f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
+
     if a.selftest_nvfp4:
         import torch
         # 1) LUT e2m1: i 16 codici devono decodificare esattamente ai valori attesi.
