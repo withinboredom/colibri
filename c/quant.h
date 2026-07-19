@@ -1,6 +1,7 @@
 /* quant.h — quantized matmul kernels (header-only, all functions static).
- * Multi-architecture SIMD: AVX2 / AVX-512 / AVX-VNNI / ARM NEON / NEON-SDOT /
- * NEON-i8mm / POWER VSX.  Pure compute — no Model or QT dependency. */
+ * Multi-architecture SIMD: AVX2 / AVX-512 / AVX-VNNI / Intel AMX-INT8 /
+ * ARM NEON / NEON-SDOT / NEON-i8mm / POWER VSX.  Pure compute — no Model or
+ * QT dependency. */
 #ifndef COLI_QUANT_H
 #define COLI_QUANT_H
 
@@ -26,6 +27,38 @@ static inline int hsum256_i32(__m256i v){
     __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
     lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
     return _mm_cvtsi128_si32(lo);
+}
+#endif
+
+/* Linux exposes AMX tile data as dynamically requested extended state.  The
+ * permission is per-thread, so every OpenMP worker asks for it on first use.
+ * Keep AMX opt-in at compile time (__AMX_* from -march=native on an AMX host,
+ * or ARCH=sapphirerapids) and fall back to VNNI if the running kernel refuses
+ * the request. */
+#if defined(__linux__) && defined(__x86_64__) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+#define COLI_AMX_INT8 1
+#include <unistd.h>
+#include <sys/syscall.h>
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#define COLI_XFEATURE_XTILEDATA 18
+
+typedef struct __attribute__((aligned(64))) {
+    uint8_t palette_id, start_row, reserved[14];
+    uint16_t colsb[16];
+    uint8_t rows[16];
+} ColiTileConfig;
+_Static_assert(sizeof(ColiTileConfig)==64,"AMX tile configuration must be 64 bytes");
+
+static int g_amx=1;
+static _Thread_local int g_amx_thread_ready=-1;
+static int amx_thread_init(void){
+    if(!g_amx) return 0;
+    if(g_amx_thread_ready>=0) return g_amx_thread_ready;
+    long rc=syscall(SYS_arch_prctl,ARCH_REQ_XCOMP_PERM,COLI_XFEATURE_XTILEDATA);
+    g_amx_thread_ready=(rc==0);
+    return g_amx_thread_ready;
 }
 #endif
 #if defined(__AVXVNNI__) && defined(__AVX2__)
@@ -269,7 +302,9 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 }
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#if defined(COLI_AMX_INT8)
+#define IDOT_KERNEL "amx-int8"
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
 #define IDOT_KERNEL "avx512-vnni"
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
 #define IDOT_KERNEL "avx-vnni"
@@ -284,6 +319,22 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #else
 #define IDOT_KERNEL "scalar"
 #endif
+static inline const char *idot_kernel_name(void){
+#if defined(COLI_AMX_INT8)
+    if(g_amx) return "amx-int8";
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    return "avx512-vnni";
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    return "avx-vnni";
+#elif defined(__AVX2__)
+    return "avx2";
+#else
+    return "scalar";
+#endif
+#else
+    return IDOT_KERNEL;
+#endif
+}
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;
@@ -592,9 +643,62 @@ static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const
 }
 #endif
 
+/* ---- Intel AMX int8 decode -------------------------------------------------
+ * Decode is a matrix-vector product W[O,I] * x[I].  That orientation is useful
+ * for AMX: a 16x64 weight tile loads directly from the existing row-major
+ * tensor (no persistent repack), while the one-column activation tile is just
+ * 16 consecutive groups of four bytes.  Each TDPBSSD therefore produces 16
+ * output rows.  Non-64 input and non-16 output tails stay on the exact IDOT
+ * kernel. */
+#if defined(COLI_AMX_INT8)
+static void matmul_q_idot_amx(float *y, const int8_t *xq, float sx, const int8_t *q,
+                              const float *scale, int I, int O){
+    int O16=O&~15;
+    #pragma omp parallel
+    {
+        int ready=amx_thread_init();
+        if(ready){
+            ColiTileConfig cfg; memset(&cfg,0,sizeof(cfg)); cfg.palette_id=1;
+            cfg.colsb[0]=4;  cfg.rows[0]=16; /* C: 16 int32 outputs */
+            cfg.colsb[1]=64; cfg.rows[1]=16; /* A: 16 weight rows x 64 bytes */
+            cfg.colsb[2]=4;  cfg.rows[2]=16; /* B: 64 activations, VNNI groups */
+            _tile_loadconfig(&cfg);
+        }
+        #pragma omp for schedule(static)
+        for(int o=0;o<O16;o+=16){
+            if(ready){
+                int32_t d[16]; int i=0;
+                _tile_zero(0);
+                for(;i+64<=I;i+=64){
+                    _tile_loadd(1,q+(int64_t)o*I+i,I);
+                    _tile_loadd(2,xq+i,4);
+                    _tile_dpbssd(0,1,2);
+                }
+                _tile_stored(0,d,sizeof(d[0]));
+                for(int r=0;r<16;r++){
+                    int32_t sum=d[r]; const int8_t *w=q+(int64_t)(o+r)*I;
+                    for(int k=i;k<I;k++) sum+=(int32_t)w[k]*xq[k];
+                    y[o+r]=(float)sum*scale[o+r]*sx;
+                }
+            }else{
+                for(int r=0;r<16;r++)
+                    y[o+r]=(float)dot_i8i8(q+(int64_t)(o+r)*I,xq,I)*scale[o+r]*sx;
+            }
+        }
+        if(ready) _tile_release();
+        #pragma omp for schedule(static)
+        for(int o=O16;o<O;o++)
+            y[o]=(float)dot_i8i8(q+(int64_t)o*I,xq,I)*scale[o]*sx;
+    }
+}
+#endif
+
 /* ---- IDOT dispatch (int8-quantized activations) --------------------------- */
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+#if defined(COLI_AMX_INT8)
+    if(g_amx && S==1 && I>=64 && O>=16){ matmul_q_idot_amx(y,xq,sx[0],q,scale,I,O); return; }
+#endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }
 #endif

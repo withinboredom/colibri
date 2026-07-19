@@ -95,7 +95,9 @@ EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
 CC      = gcc
-# ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
+# ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce); on
+# Intel AMX hosts this also enables the AMX-INT8 S=1 decode kernel.
+# ARCH=sapphirerapids -> explicit AMX build for Sapphire/Emerald Rapids hosts.
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).

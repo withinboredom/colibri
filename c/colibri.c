@@ -5249,6 +5249,15 @@ int main(int argc, char **argv){
 #endif
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+#ifdef COLI_AMX_INT8
+    g_amx = getenv("AMX")?atoi(getenv("AMX"))!=0:1;
+    if(g_amx && amx_thread_init())
+        fprintf(stderr,"[AMX] INT8 decode tiles active (AMX=0 to use the VNNI fallback)\n");
+    else if(g_amx){
+        fprintf(stderr,"[AMX] tile state unavailable; using the VNNI fallback\n");
+        g_amx=0;
+    }
+#endif
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
@@ -5324,7 +5333,8 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
-    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: %s ==\n",
+           cap,ebits,dbits,idot_kernel_name());
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){
