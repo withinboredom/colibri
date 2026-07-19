@@ -142,15 +142,15 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
 
 /* PILOT_REAL has already paid the disk cost and published the future expert in
- * RAM.  During CPU execution, pull the following resident expert into the LLC
- * while the current expert is doing its matmuls.  T2 is the x86 shared-cache
- * hint (normally L3); touching every cache line matters because an expert slab
- * is much larger than the hardware prefetcher's lookahead window. */
-static inline void l3_prefetch_range(const void *ptr, int64_t bytes){
+ * RAM.  Prime only the first few lines of each following weight matrix: this
+ * starts its page walk/TLB lookup without flooding LLC with a ~19 MB expert
+ * (eight experts exceed LLC and caused a measured 3x throughput regression). */
+static inline void l3_prefetch_matrix_start(const void *ptr, int64_t bytes){
 #if COLI_X86_L3_PREFETCH
     const char *p=(const char*)ptr;
     if(!p || bytes<=0) return;
-    for(int64_t off=0;off<bytes;off+=64) _mm_prefetch(p+off,_MM_HINT_T2);
+    int64_t limit=bytes<4*64 ? bytes : 4*64;
+    for(int64_t off=0;off<limit;off+=64) _mm_prefetch(p+off,_MM_HINT_T2);
 #else
     (void)ptr; (void)bytes;
 #endif
@@ -164,8 +164,7 @@ static inline void qt_prefetch_l3(const QT *t){
     }
     const void *weights=t->fmt==0?(const void*)t->qf:
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
-    l3_prefetch_range(weights,qt_bytes(t)-scale_bytes);
-    l3_prefetch_range(t->s,scale_bytes);
+    l3_prefetch_matrix_start(weights,qt_bytes(t)-scale_bytes);
 }
 static inline void expert_prefetch_l3(const ESlot *e){
     qt_prefetch_l3(&e->g);
