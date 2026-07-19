@@ -52,9 +52,20 @@ typedef struct __attribute__((aligned(64))) {
 _Static_assert(sizeof(ColiTileConfig)==64,"AMX tile configuration must be 64 bytes");
 
 static int g_amx=1;
-/* Minimum batch for the AMX GEMM path.  Below 16 tokens the B tile is
- * zero-padded, so occupancy is S/16; at 8 that is still ~4x VNNI. */
-static int g_amx_min_s=8;
+/* Minimum batch for the AMX GEMM path.  Measured on Xeon 6731P (8ch DDR5-4800,
+ * 265 GB/s STREAM) at the GLM expert shape O=2048 I=6144, 24 GB out-of-cache
+ * weight bank, GB/s of weight stream sustained:
+ *
+ *      S      1     2     4     8    12    16    24    32
+ *   AMX    214   170   172   167   164   180   115   ~89 (noisy)
+ *   VNNI   227   223   216   169   135   110    80    61
+ *
+ * Below S=12 the zero-padded B tile wastes more than the tile array wins, and
+ * VNNI is still memory-bound anyway.  From S=12 VNNI goes compute-bound and AMX
+ * pulls ahead; S=16 is the sweet spot (exactly one chunk, no padding, +65%).
+ * Sizes that are not multiples of 16 pay a padded tail — S=20 measures worse
+ * than S=16.  Default to the crossover, not below it. */
+static int g_amx_min_s=12;
 static _Thread_local int g_amx_thread_ready=-1;
 static int amx_thread_init(void){
     if(!g_amx) return 0;

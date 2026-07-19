@@ -515,6 +515,29 @@ static void numa_slab_bind(void *p, size_t n){
     (void)p;(void)n;
 #endif
 }
+/* THP sull'arena expert / THP on the expert arena.
+ * L'arena e' ~240 GB di pagine da 4 KB (~61 M PTE) e ogni token ci fa passare
+ * ~600 slab di expert. Lo streamer L2 di Intel NON prefetcha oltre il confine
+ * di 4 KB: una lettura sequenziale di uno slab da 19 MB riparte da zero 4600
+ * volte. Con pagine da 2 MB il prefetcher riparte 512 volte di meno.
+ * EN: the L2 streamer will not prefetch across a 4 KB boundary, so a sequential
+ * 19 MB slab read restarts the prefetcher ~4600 times; 2 MB pages cut that 512x.
+ * Distro kernels ship THP=madvise, so it never applies unless we ask for it.
+ * We madvise only the 2 MB-aligned INTERIOR: the ragged head/tail stay on 4 KB
+ * pages, so this costs no extra resident memory (rounding 12k slabs up to a
+ * 2 MB multiple would have cost ~12 GB on a box already at 239/256 GB). */
+static int g_thp=1;
+#define COLI_HPAGE ((size_t)2<<20)
+static void slab_hugepage(void *p, size_t n){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if(!g_thp || !p || n<COLI_HPAGE) return;
+    uintptr_t a=((uintptr_t)p+(COLI_HPAGE-1)) & ~(uintptr_t)(COLI_HPAGE-1);
+    uintptr_t e=((uintptr_t)p+n) & ~(uintptr_t)(COLI_HPAGE-1);
+    if(e>a) madvise((void*)a,(size_t)(e-a),MADV_HUGEPAGE);
+#else
+    (void)p;(void)n;
+#endif
+}
 static void numa_init(void){
 #ifdef __linux__
     if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
@@ -532,7 +555,10 @@ static void *qalloc(size_t n){
         coli_metal_register(p,r); return p; }
 #endif
     void *p=malloc(n);
-    if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
+    if(n>=(size_t)1<<20){
+        numa_slab_bind(p,n);                       /* resident dense weights too (#82: attention/shared stream from RAM every token) */
+        slab_hugepage(p,n);                        /* stessa ragione: streaming ogni token / same reason: streamed every token */
+    }
     return p;
 }
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
@@ -1162,9 +1188,15 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         if(g_metal_enabled) coli_metal_register(s->slab,need);
 #else
         compat_aligned_free(s->slab);
-        if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
+        /* 2 MB-allineato: la base deve cadere su una huge page perche' l'interno
+         * sia mappabile in THP. posix_memalign per queste taglie passa da mmap,
+         * quindi l'allineamento non costa RAM residente.
+         * EN: 2 MB-aligned so the interior is THP-mappable; at this size
+         * posix_memalign goes through mmap, so alignment costs no resident RAM. */
+        if(posix_memalign((void**)&s->slab,COLI_HPAGE,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
         numa_slab_bind(s->slab,(size_t)s->slab_cap);
+        slab_hugepage(s->slab,(size_t)s->slab_cap);
 #endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
@@ -1336,9 +1368,10 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->slab_cap=need; if(g_metal_enabled) coli_metal_register(s->slab,need);
 #else
         compat_aligned_free(s->slab);
-        if(posix_memalign((void**)&s->slab,4096,(size_t)wtot+8192)){
+        if(posix_memalign((void**)&s->slab,COLI_HPAGE,(size_t)wtot+8192)){
             s->slab=NULL; s->slab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert slab"),li; }
         s->slab_cap=wtot+8192;
+        slab_hugepage(s->slab,(size_t)s->slab_cap);
 #endif
     }
     if(!s->fslab || ftot>s->fslab_cap){
@@ -3952,6 +3985,14 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         io_svc,io_w);
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
         pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
+#ifdef __linux__
+    {   /* quanta parte dell'arena e' davvero su huge page / how much of the arena actually got THP */
+        FILE *mi=fopen("/proc/meminfo","r"); char ln[256]; long ahp=-1;
+        if(mi){ while(fgets(ln,sizeof(ln),mi)) if(sscanf(ln,"AnonHugePages: %ld kB",&ahp)==1) break;
+                fclose(mi); }
+        if(ahp>=0) fprintf(f,"[PROF] transparent hugepages: %.1f GB anon (THP=%d)\n",ahp/1e6,g_thp);
+    }
+#endif
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
     double route=m->t_route-b->route,p2p=m->t_p2p-b->p2p;
     uint64_t np2p=m->n_p2p-b->n_p2p;
@@ -5305,6 +5346,7 @@ int main(int argc, char **argv){
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
 #ifdef COLI_AMX_INT8
+    g_thp = getenv("THP")?atoi(getenv("THP"))!=0:1;   /* THP=0 per A/B contro le pagine da 4 KB / A/B against 4 KB pages */
     g_amx = getenv("AMX")?atoi(getenv("AMX"))!=0:1;
     if(getenv("AMX_MIN_S")){ g_amx_min_s=atoi(getenv("AMX_MIN_S")); if(g_amx_min_s<2) g_amx_min_s=2; }
     if(g_amx && amx_thread_init())
