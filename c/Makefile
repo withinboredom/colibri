@@ -101,8 +101,15 @@ CC      = gcc
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
+# VECW=512 -> -mprefer-vector-width=512. GCC's tuning for Intel server parts
+# defaults to 256, so every AUTO-vectorized loop emits 32-byte vectors on a
+# machine that has 64-byte ones -- notably the MLA attention core (score at
+# colibri.c:2136, value at :2144), which is ~32% of decode. The hand-written
+# intrinsic kernels in quant.h are unaffected: they already name their width.
+# Left opt-in because 512-bit code can cost all-core frequency -- measure both.
+VECW   ?=
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 -march=$(ARCH) $(if $(VECW),-mprefer-vector-width=$(VECW)) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
