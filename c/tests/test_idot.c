@@ -67,6 +67,9 @@ static int check_driver(int fmt,int O,int I,int S){
 }
 
 int main(void){
+#ifdef COLI_AMX_INT8
+    if(!amx_thread_init()) g_amx=0;
+#endif
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
     static int8_t w[8192], x[8192]; static uint8_t w4[4096];
     for(unsigned t=0;t<sizeof(sizes)/sizeof(sizes[0]);t++){
@@ -83,7 +86,7 @@ int main(void){
             if(got!=want){ fprintf(stderr,"FAIL dot_i4i8 I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
         }
     }
-    printf("idot kernel exactness (%s): ok\n", IDOT_KERNEL);
+    printf("idot kernel exactness (%s): ok\n", idot_kernel_name());
 
     static const int Os[]={1,2,3,64,65};
     static const int Is[]={16,17,100,1408};
@@ -94,6 +97,12 @@ int main(void){
        for(unsigned c=0;c<sizeof Ss/sizeof Ss[0];c++)
         for(int fmt=1;fmt<=2;fmt++)
          if(check_driver(fmt,Os[a],Is[b],Ss[c])) return 1;
-    printf("idot driver exactness (%s): ok\n", IDOT_KERNEL);
+    /* S=1 is the decode shape.  On AMX hosts this exercises the 16x64 tile
+     * driver; elsewhere it remains an exact regression for its fallback. */
+    for(int rep=0;rep<4;rep++)
+     for(unsigned a=0;a<sizeof Os/sizeof Os[0];a++)
+      for(unsigned b=0;b<sizeof Is/sizeof Is[0];b++)
+       if(check_driver(1,Os[a],Is[b],1)) return 1;
+    printf("idot driver exactness (%s): ok\n", idot_kernel_name());
     return 0;
 }
