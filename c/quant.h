@@ -52,6 +52,9 @@ typedef struct __attribute__((aligned(64))) {
 _Static_assert(sizeof(ColiTileConfig)==64,"AMX tile configuration must be 64 bytes");
 
 static int g_amx=1;
+/* Minimum batch for the AMX GEMM path.  Below 16 tokens the B tile is
+ * zero-padded, so occupancy is S/16; at 8 that is still ~4x VNNI. */
+static int g_amx_min_s=8;
 static _Thread_local int g_amx_thread_ready=-1;
 static int amx_thread_init(void){
     if(!g_amx) return 0;
@@ -693,11 +696,103 @@ static void matmul_q_idot_amx(float *y, const int8_t *xq, float sx, const int8_t
 }
 #endif
 
+/* ---- Intel AMX int8 batch GEMM (prefill) -----------------------------------
+ * The S=1 kernel above leaves 15 of the TMUL array's 16 columns idle: TDPBSSD
+ * always computes 16x16, and a matrix-vector product only fills one column.
+ * With a batch we fill them.  C[m][n] = out row (o+m) for token (s0+n), so the
+ * A tile is unchanged (16 weight rows x 64 bytes, straight from the row-major
+ * tensor) and B carries 16 tokens instead of one.
+ *
+ * B must be VNNI-packed: TDPBSSD reads B[k][4n+j], i.e. the four k-neighbours
+ * of a token must sit adjacent, tokens interleaved.  xq is [S][I], so this is a
+ * transpose into bp[kb][k][n][j] = xq[(s0+n)*I + kb*64 + 4k + j].  The pack is
+ * O(S*I) against O(S*I*O) of multiply, and it is hoisted out of the o loop so
+ * every output tile re-reads the same packed B.
+ *
+ * Short batches zero-pad n to 16 rather than narrowing colsb, which keeps a
+ * single tile configuration for the whole call.  I%64 and O%16 tails stay on
+ * the exact IDOT kernel, as does any thread the kernel denied tile state. */
+#if defined(COLI_AMX_INT8)
+static _Thread_local int8_t *g_amx_bp=NULL;
+static _Thread_local size_t g_amx_bp_cap=0;
+static int8_t *amx_bpack(size_t n){
+    if(n>g_amx_bp_cap){
+        int8_t *p=realloc(g_amx_bp,n);
+        if(!p){ fprintf(stderr,"OOM amx pack scratch\n"); exit(1); }
+        g_amx_bp=p; g_amx_bp_cap=n;
+    }
+    return g_amx_bp;
+}
+static void matmul_q_idot_amx_mm(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                                 const float *scale, int S, int I, int O){
+    int nkb=I/64, I64=nkb*64, O16=O&~15, tail=I-I64;
+    int8_t *bp=amx_bpack((size_t)nkb*1024);
+    for(int s0=0;s0<S;s0+=16){
+        int ns=S-s0<16?S-s0:16;
+        if(ns<16) memset(bp,0,(size_t)nkb*1024);
+        #pragma omp parallel
+        {
+            int ready=amx_thread_init();
+            if(ready){
+                ColiTileConfig cfg; memset(&cfg,0,sizeof(cfg)); cfg.palette_id=1;
+                for(int t=0;t<3;t++){ cfg.colsb[t]=64; cfg.rows[t]=16; } /* C, A, B all 16x64 */
+                _tile_loadconfig(&cfg);
+            }
+            #pragma omp for schedule(static)
+            for(int kb=0;kb<nkb;kb++)
+                for(int n=0;n<ns;n++){                     /* 64 contiguous source bytes */
+                    const int8_t *src=xq+(int64_t)(s0+n)*I+(int64_t)kb*64;
+                    for(int k=0;k<16;k++) memcpy(bp+((size_t)(kb*16+k)*16+n)*4,src+4*k,4);
+                }
+            #pragma omp for schedule(static)
+            for(int o=0;o<O16;o+=16){
+                if(ready){
+                    int32_t d[16][16] __attribute__((aligned(64)));
+                    _tile_zero(0);
+                    for(int kb=0;kb<nkb;kb++){
+                        _tile_loadd(1,q+(int64_t)o*I+(int64_t)kb*64,I);
+                        _tile_loadd(2,bp+(int64_t)kb*1024,64);
+                        _tile_dpbssd(0,1,2);
+                    }
+                    _tile_stored(0,d,sizeof(d[0]));
+                    for(int r=0;r<16;r++){
+                        const int8_t *w=q+(int64_t)(o+r)*I; float sc=scale[o+r];
+                        for(int n=0;n<ns;n++){
+                            const int8_t *xs=xq+(int64_t)(s0+n)*I;
+                            int32_t sum=d[r][n];
+                            if(tail) sum+=dot_i8i8(w+I64,xs+I64,tail);
+                            y[(int64_t)(s0+n)*O+o+r]=(float)sum*sc*sx[s0+n];
+                        }
+                    }
+                }else{
+                    for(int r=0;r<16;r++){
+                        const int8_t *w=q+(int64_t)(o+r)*I; float sc=scale[o+r];
+                        for(int n=0;n<ns;n++)
+                            y[(int64_t)(s0+n)*O+o+r]=
+                                (float)dot_i8i8(w,xq+(int64_t)(s0+n)*I,I)*sc*sx[s0+n];
+                    }
+                }
+            }
+            if(ready) _tile_release();
+            #pragma omp for schedule(static)
+            for(int o=O16;o<O;o++){
+                const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+                for(int n=0;n<ns;n++)
+                    y[(int64_t)(s0+n)*O+o]=(float)dot_i8i8(w,xq+(int64_t)(s0+n)*I,I)*sc*sx[s0+n];
+            }
+        }
+    }
+}
+#endif
+
 /* ---- IDOT dispatch (int8-quantized activations) --------------------------- */
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
 #if defined(COLI_AMX_INT8)
-    if(g_amx && S==1 && I>=64 && O>=16){ matmul_q_idot_amx(y,xq,sx[0],q,scale,I,O); return; }
+    if(g_amx && I>=64 && O>=16){
+        if(S==1){ matmul_q_idot_amx(y,xq,sx[0],q,scale,I,O); return; }
+        if(S>=g_amx_min_s){ matmul_q_idot_amx_mm(y,xq,sx,q,scale,S,I,O); return; }
+    }
 #endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }

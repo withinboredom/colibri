@@ -88,9 +88,11 @@ int main(void){
     }
     printf("idot kernel exactness (%s): ok\n", idot_kernel_name());
 
-    static const int Os[]={1,2,3,64,65};
-    static const int Is[]={16,17,100,1408};
-    static const int Ss[]={2,3,4,5,8};
+    /* O=16 / I=64 are the AMX minimum tile; S=8,9,15,16,17,33 cover the batch
+     * kernel's zero-padded short chunk, the exact 16-token chunk and its tail. */
+    static const int Os[]={1,2,3,16,64,65};
+    static const int Is[]={16,17,64,100,1408};
+    static const int Ss[]={2,3,4,5,8,9,15,16,17,33};
     for(int rep=0;rep<4;rep++)
      for(unsigned a=0;a<sizeof Os/sizeof Os[0];a++)
       for(unsigned b=0;b<sizeof Is/sizeof Is[0];b++)

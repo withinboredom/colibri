@@ -5306,8 +5306,9 @@ int main(int argc, char **argv){
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
 #ifdef COLI_AMX_INT8
     g_amx = getenv("AMX")?atoi(getenv("AMX"))!=0:1;
+    if(getenv("AMX_MIN_S")){ g_amx_min_s=atoi(getenv("AMX_MIN_S")); if(g_amx_min_s<2) g_amx_min_s=2; }
     if(g_amx && amx_thread_init())
-        fprintf(stderr,"[AMX] INT8 decode tiles active (AMX=0 to use the VNNI fallback)\n");
+        fprintf(stderr,"[AMX] INT8 tiles active: S=1 decode + S>=%d GEMM (AMX=0 to use the VNNI fallback)\n",g_amx_min_s);
     else if(g_amx){
         fprintf(stderr,"[AMX] tile state unavailable; using the VNNI fallback\n");
         g_amx=0;
