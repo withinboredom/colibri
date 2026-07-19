@@ -53,7 +53,7 @@ Format: `VAR` — default — effect.
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
 | `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
-| `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
+| `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). On x86-64 CPU execution, the resolved expert loop also prefetches the next resident expert into the shared cache (T2/L3 hint) while computing the current one. |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
 | `PILOT_TWO` | `0` (off) | Two-step shared-expert-corrected router prediction for the pilot. |
 | `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |

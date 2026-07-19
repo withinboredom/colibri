@@ -28,6 +28,12 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>                            /* _mm_prefetch: PILOT_REAL one-expert lookahead */
+#define COLI_X86_L3_PREFETCH 1
+#else
+#define COLI_X86_L3_PREFETCH 0
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #endif
@@ -134,6 +140,38 @@ typedef struct {
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+
+/* PILOT_REAL has already paid the disk cost and published the future expert in
+ * RAM.  During CPU execution, pull the following resident expert into the LLC
+ * while the current expert is doing its matmuls.  T2 is the x86 shared-cache
+ * hint (normally L3); touching every cache line matters because an expert slab
+ * is much larger than the hardware prefetcher's lookahead window. */
+static inline void l3_prefetch_range(const void *ptr, int64_t bytes){
+#if COLI_X86_L3_PREFETCH
+    const char *p=(const char*)ptr;
+    if(!p || bytes<=0) return;
+    for(int64_t off=0;off<bytes;off+=64) _mm_prefetch(p+off,_MM_HINT_T2);
+#else
+    (void)ptr; (void)bytes;
+#endif
+}
+static inline void qt_prefetch_l3(const QT *t){
+    int64_t scale_bytes=0;
+    if(t->fmt!=0){
+        int64_t scales=t->O;
+        if(t->fmt==4) scales*=(t->I+t->gs-1)/t->gs;
+        scale_bytes=scales*(int64_t)sizeof(float);
+    }
+    const void *weights=t->fmt==0?(const void*)t->qf:
+                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+    l3_prefetch_range(weights,qt_bytes(t)-scale_bytes);
+    l3_prefetch_range(t->s,scale_bytes);
+}
+static inline void expert_prefetch_l3(const ESlot *e){
+    qt_prefetch_l3(&e->g);
+    qt_prefetch_l3(&e->u);
+    qt_prefetch_l3(&e->d);
+}
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -2603,6 +2641,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ngroup++; continue;
             }
 #endif
+            /* PILOT_REAL's cross-layer load makes predicted hits safe and stable here.
+             * Prefetch the next expert only after resolve, and never inspect a PIPE miss
+             * whose worker may still be replacing its slab.  GPU-handled experts do not
+             * consume host weights, so skip them rather than spending DDR bandwidth. */
+            if(g_pilot_real){
+                for(int nj=j+1;nj<nb;nj++){
+                    if(g_pipe && qof[nj]>=0) continue;
+#ifdef COLI_METAL
+                    if(g_metal_enabled && ((is_miss[nj]&&!cpu_miss) || (!is_miss[nj]&&!cpu_res))) continue;
+#endif
+#ifdef COLI_CUDA
+                    ESlot *ne=use[nj];
+                    if(g_cuda_enabled && ne->g.cuda_eligible && ne->u.cuda_eligible && ne->d.cuda_eligible) continue;
+#endif
+                    expert_prefetch_l3(use[nj]);
+                    break;
+                }
+            }
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
