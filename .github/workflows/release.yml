@@ -24,7 +24,9 @@ jobs:
             name: windows-x86_64
             ext: ".exe"
             make_args: ""
-            shell: msys2
+            # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
+            # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
+            shell: "msys2 {0}"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -32,11 +34,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - if: matrix.shell == 'msys2'
+      - if: matrix.os == 'windows-latest'
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: false
+          # inherit: the Package step calls the runner's 7z.exe, which lives on
+          # the Windows PATH; the default minimal path would not see it.
+          path-type: inherit
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
